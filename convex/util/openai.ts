@@ -1,4 +1,7 @@
+import { initLogger, Logger, Span } from 'braintrust';
+
 // That's right! No imports and no dependencies 🤯
+let braintrust: Logger | null = null;
 
 // Overload for non-streaming
 export async function chatCompletion(
@@ -21,51 +24,77 @@ export async function chatCompletion(
     model?: CreateChatCompletionRequest['model'];
   },
 ) {
+  if (braintrust === null && process.env.BRAINTRUST_API_KEY) {
+    braintrust = initLogger({
+      projectName: 'ai-town-test',
+      orgName: process.env.BRAINTRUST_ORG_NAME,
+      apiKey: process.env.BRAINTRUST_API_KEY,
+    });
+  }
+
   checkForAPIKey();
 
   body.model = body.model ?? 'gpt-3.5-turbo-16k';
   const openaiApiBase = process.env.OPENAI_API_BASE || 'https://api.openai.com';
   const stopWords = body.stop ? (typeof body.stop === 'string' ? [body.stop] : body.stop) : [];
-  const {
-    result: content,
-    retries,
-    ms,
-  } = await retryWithBackoff(async () => {
-    const apiUrl = openaiApiBase + '/v1/chat/completions';
-    const result = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + process.env.OPENAI_API_KEY,
-      },
 
-      body: JSON.stringify(body),
-    });
-    if (!result.ok) {
-      throw {
-        retry: result.status === 429 || result.status >= 500,
-        error: new Error(
-          `Chat completion failed with code ${result.status}: ${await result.text()}`,
-        ),
-      };
-    }
-    if (body.stream) {
-      return new ChatCompletionContent(result.body!, stopWords);
-    } else {
-      const json = (await result.json()) as CreateChatCompletionResponse;
-      const content = json.choices[0].message?.content;
-      if (content === undefined) {
-        throw new Error('Unexpected result from OpenAI: ' + JSON.stringify(json));
-      }
-      return content;
-    }
+  let span: Span | undefined = await braintrust?.startSpan({
+    name: 'OpenAI Completion',
+    event: {
+      input: body,
+    },
   });
 
-  return {
-    content,
-    retries,
-    ms,
-  };
+  try {
+    const {
+      result: content,
+      retries,
+      ms,
+    } = await retryWithBackoff(async () => {
+      const apiUrl = openaiApiBase + '/v1/chat/completions';
+      const result = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + process.env.OPENAI_API_KEY,
+        },
+
+        body: JSON.stringify(body),
+      });
+      if (!result.ok) {
+        throw {
+          retry: result.status === 429 || result.status >= 500,
+          error: new Error(
+            `Chat completion failed with code ${result.status}: ${await result.text()}`,
+          ),
+        };
+      }
+      if (body.stream) {
+        const ret = new ChatCompletionContent(result.body!, stopWords, span);
+        span = undefined;
+        return ret;
+      } else {
+        const json = (await result.json()) as CreateChatCompletionResponse;
+        const content = json.choices[0].message?.content;
+        if (content === undefined) {
+          throw new Error('Unexpected result from OpenAI: ' + JSON.stringify(json));
+        }
+
+        span?.log({
+          output: content,
+        });
+        return content;
+      }
+    });
+
+    return {
+      content,
+      retries,
+      ms,
+    };
+  } finally {
+    span?.end();
+  }
 }
 
 export async function fetchEmbeddingBatch(texts: string[]) {
@@ -412,13 +441,16 @@ const suffixOverlapsPrefix = (s1: string, s2: string) => {
 export class ChatCompletionContent {
   private readonly body: ReadableStream<Uint8Array>;
   private readonly stopWords: string[];
+  private readonly span?: Span;
 
-  constructor(body: ReadableStream<Uint8Array>, stopWords: string[]) {
+  constructor(body: ReadableStream<Uint8Array>, stopWords: string[], span?: Span) {
     this.body = body;
     this.stopWords = stopWords;
+    this.span = span;
   }
 
   async *readInner() {
+    let fullText = '';
     for await (const data of this.splitStream(this.body)) {
       if (data.startsWith('data: ')) {
         try {
@@ -426,6 +458,7 @@ export class ChatCompletionContent {
             choices: { delta: { content?: string } }[];
           };
           if (json.choices[0].delta.content) {
+            fullText += json.choices[0].delta.content;
             yield json.choices[0].delta.content;
           }
         } catch (e) {
@@ -433,6 +466,11 @@ export class ChatCompletionContent {
         }
       }
     }
+
+    this.span?.log({
+      output: fullText,
+    });
+    this.span?.end();
   }
 
   // stop words in OpenAI api don't always work.
